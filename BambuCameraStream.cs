@@ -35,7 +35,7 @@ public class BambuCameraStream
 
                 connectAttempts++;
 
-                using var sslStream = new SslStream(client.GetStream(), false, (_, _, _, _) => true, null);
+                using var sslStream = new SslStream(client.GetStream(), false, (_, _, _, _) => true);
                 sslStream.AuthenticateAsClient(Hostname);
 
                 sslStream.Write(authData);
@@ -108,28 +108,32 @@ public class BambuCameraStream
                 }
 
                 // Append to current image
-                if (imageBuffer != null)
+                if (imageBuffer == null)
                 {
-                    var toCopy = Math.Min(bytesRead, payloadSize - imageOffset);
-                    Array.Copy(buffer, 0, imageBuffer, imageOffset, toCopy);
-                    imageOffset += toCopy;
-
-                    if (imageOffset == payloadSize)
-                    {
-                        // Full image received
-                        if (StartsWith(imageBuffer, JpegStart) && EndsWith(imageBuffer, JpegEnd))
-                        {
-                            Console.OpenStandardOutput().Write(imageBuffer, 0, imageBuffer.Length);
-                            Console.OpenStandardOutput().Flush();
-                        }
-
-                        // Reset for next image
-                        imageBuffer = null;
-                        imageOffset = 0;
-                    }
+                    continue;
                 }
+
+                var toCopy = Math.Min(bytesRead, payloadSize - imageOffset);
+                Array.Copy(buffer, 0, imageBuffer, imageOffset, toCopy);
+                imageOffset += toCopy;
+
+                if (imageOffset != payloadSize)
+                {
+                    continue;
+                }
+
+                // Full image received
+                if (StartsWith(imageBuffer, JpegStart) && EndsWith(imageBuffer, JpegEnd))
+                {
+                    Console.OpenStandardOutput().Write(imageBuffer, 0, imageBuffer.Length);
+                    Console.OpenStandardOutput().Flush();
+                }
+
+                // Reset for next image
+                imageBuffer = null;
+                imageOffset = 0;
             }
-            catch (Exception ex) when (ex is IOException || ex is TimeoutException)
+            catch (Exception ex) when (ex is IOException or TimeoutException)
             {
                 Thread.Sleep(500);
             }
