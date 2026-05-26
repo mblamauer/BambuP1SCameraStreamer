@@ -1,0 +1,3 @@
+﻿using BambuStreamer;
+
+BambuCameraStream.Run();
