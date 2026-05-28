@@ -186,15 +186,17 @@ public static class BambuCameraStream
 
                         if (IsJpeg(image.Span))
                         {
-                            await stdout.WriteAsync(image, ct);
-                            await stdout.FlushAsync(ct);
-
                             if (writeImages)
                             {
                                 var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
                                 var imagePath = Path.Combine(ImagesDir, $"image_{timestamp}.jpg");
 
                                 await File.WriteAllBytesAsync(imagePath, image, ct);
+                            }
+                            else
+                            {
+                                await stdout.WriteAsync(image, ct);
+                                await stdout.FlushAsync(ct);
                             }
                         }
                         else
