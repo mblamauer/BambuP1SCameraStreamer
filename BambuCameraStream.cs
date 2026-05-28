@@ -25,7 +25,6 @@ public static class BambuCameraStream
 
     // Socket timeouts (ms)
     private const int ReceiveTimeoutMs = 10_000;
-    private const int SendTimeoutMs = 5_000;
 
     // Reconnect backoff
     private const int InitialBackoffMs = 1_000;
@@ -48,10 +47,13 @@ public static class BambuCameraStream
     
     private static readonly string ImagesDir = Path.Combine(AppContext.BaseDirectory, "Images");
 
-    public static async Task RunAsync()
+    public static async Task RunAsync(bool writeImages)
     {
-        Directory.CreateDirectory(ImagesDir);
-        
+        if (writeImages)
+        {
+            Directory.CreateDirectory(ImagesDir);
+        }
+
         using var cts = new CancellationTokenSource();
 
         Console.CancelKeyPress += (_, e) =>
@@ -74,7 +76,6 @@ public static class BambuCameraStream
             {
                 using var client = new TcpClient();
                 client.ReceiveTimeout = ReceiveTimeoutMs;
-                client.SendTimeout = SendTimeoutMs;
 
                 await client.ConnectAsync(Hostname, Port, cts.Token);
 
@@ -93,7 +94,7 @@ public static class BambuCameraStream
                 connectAttempts = 0;
                 backoffMs = InitialBackoffMs;
 
-                await ReceiveImagesAsync(sslStream, stdout, cts.Token);
+                await ReceiveImagesAsync(sslStream, stdout, writeImages, cts.Token);
             }
             catch (OperationCanceledException) when (cts.IsCancellationRequested)
             {
@@ -160,8 +161,8 @@ public static class BambuCameraStream
         // Caller-provided destination is assumed zero-initialized (new byte[]).
     }
 
-    private static async Task ReceiveImagesAsync(
-        SslStream sslStream, Stream stdout, CancellationToken ct)
+    private static async Task ReceiveImagesAsync(SslStream sslStream, Stream stdout, 
+        bool writeImages, CancellationToken ct)
     {
         var pool = ArrayPool<byte>.Shared;
         var headerBuffer = pool.Rent(HeaderSize);
@@ -195,11 +196,14 @@ public static class BambuCameraStream
                         {
                             await stdout.WriteAsync(image, ct);
                             await stdout.FlushAsync(ct);
-                            
-                            var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
-                            var imagePath = Path.Combine(ImagesDir, $"image_{timestamp}.jpg");
-                            
-                            await File.WriteAllBytesAsync(imagePath, image, ct);
+
+                            if (writeImages)
+                            {
+                                var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
+                                var imagePath = Path.Combine(ImagesDir, $"image_{timestamp}.jpg");
+
+                                await File.WriteAllBytesAsync(imagePath, image, ct);
+                            }
                         }
                         else
                         {

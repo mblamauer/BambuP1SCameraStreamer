@@ -1,3 +1,5 @@
 ﻿using BambuStreamer;
 
-await BambuCameraStream.RunAsync();
+var writeImages = args.Contains("--write-images");
+
+await BambuCameraStream.RunAsync(writeImages);
