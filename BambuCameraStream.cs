@@ -36,18 +36,10 @@ public static class BambuCameraStream
 
     private static ReadOnlySpan<byte> JpegStart => [0xFF, 0xD8, 0xFF];
     private static ReadOnlySpan<byte> JpegEnd => [0xFF, 0xD9];
-
-    private static readonly string AccessCode =
-        Environment.GetEnvironmentVariable("PRINTER_ACCESS_CODE")
-        ?? throw new InvalidOperationException("PRINTER_ACCESS_CODE environment variable not set");
-
-    private static readonly string Hostname =
-        Environment.GetEnvironmentVariable("PRINTER_ADDRESS")
-        ?? throw new InvalidOperationException("PRINTER_ADDRESS environment variable not set");
     
     private static readonly string ImagesDir = Path.Combine(AppContext.BaseDirectory, "Images");
 
-    public static async Task RunAsync(bool writeImages)
+    public static async Task RunAsync(string accessCode, string printerIpAddress,  bool writeImages)
     {
         if (writeImages)
         {
@@ -62,7 +54,7 @@ public static class BambuCameraStream
             cts.Cancel();
         };
 
-        var authData = BuildAuthData();
+        var authData = BuildAuthData(accessCode);
         await using var stdout = Console.OpenStandardOutput();
 
         var connectAttempts = 0;
@@ -77,13 +69,13 @@ public static class BambuCameraStream
                 using var client = new TcpClient();
                 client.ReceiveTimeout = ReceiveTimeoutMs;
 
-                await client.ConnectAsync(Hostname, Port, cts.Token);
+                await client.ConnectAsync(printerIpAddress, Port, cts.Token);
 
                 // Printer uses a self-signed certificate on the LAN; skip validation intentionally.
                 await using var sslStream = new SslStream(
                     client.GetStream(), false, (_, _, _, _) => true);
 
-                await sslStream.AuthenticateAsClientAsync(Hostname);
+                await sslStream.AuthenticateAsClientAsync(printerIpAddress);
 
                 await sslStream.WriteAsync(authData, cts.Token);
                 await sslStream.FlushAsync(cts.Token);
@@ -127,7 +119,7 @@ public static class BambuCameraStream
         }
     }
 
-    private static byte[] BuildAuthData()
+    private static byte[] BuildAuthData(string accessCode)
     {
         var packet = new byte[AuthPacketSize];
         var span = packet.AsSpan();
@@ -137,7 +129,7 @@ public static class BambuCameraStream
         // Bytes 8..16 are left as zero.
 
         WriteAsciiFixed(span.Slice(UsernameOffset, UsernameLength), Username);
-        WriteAsciiFixed(span.Slice(AccessCodeOffset, AccessCodeLength), AccessCode);
+        WriteAsciiFixed(span.Slice(AccessCodeOffset, AccessCodeLength), accessCode);
 
         return packet;
     }
