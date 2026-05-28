@@ -20,11 +20,15 @@ public class BambuCameraStream
 
     private static readonly byte[] JpegStart = [0xFF, 0xD8, 0xFF, 0xE0];
     private static readonly byte[] JpegEnd = [0xFF, 0xD9];
+    
+    private static readonly string ImagesDir = Path.Combine(AppContext.BaseDirectory, "Images");
 
     public static void Run()
     {
         var connectAttempts = 0;
         var authData = BuildAuthData();
+        
+        Directory.CreateDirectory(ImagesDir);
 
         while (connectAttempts < MaxConnectAttempts)
         {
@@ -127,6 +131,11 @@ public class BambuCameraStream
                 {
                     Console.OpenStandardOutput().Write(imageBuffer, 0, imageBuffer.Length);
                     Console.OpenStandardOutput().Flush();
+                    
+                    // var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
+                    // var imagePath = Path.Combine(ImagesDir, $"image_{timestamp}.jpg");
+                    //
+                    // File.WriteAllBytes(imagePath, imageBuffer);
                 }
 
                 // Reset for next image
@@ -135,6 +144,7 @@ public class BambuCameraStream
             }
             catch (Exception ex) when (ex is IOException or TimeoutException)
             {
+                Console.WriteLine($"Error reading from stream: {ex.Message}");
                 Thread.Sleep(500);
             }
         }
