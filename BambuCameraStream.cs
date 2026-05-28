@@ -186,9 +186,9 @@ public static class BambuCameraStream
 
                         if (IsJpeg(image.Span))
                         {
-                            await Console.Error.WriteLineAsync("Received JPEG payload.");
                             if (writeImages)
                             {
+                                await Console.Error.WriteLineAsync("Received JPEG payload.");
                                 var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
                                 var imagePath = Path.Combine(ImagesDir, $"image_{timestamp}.jpg");
 
