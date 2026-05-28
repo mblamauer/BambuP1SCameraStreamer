@@ -6,66 +6,124 @@ using System.Text;
 
 namespace BambuStreamer;
 
-public class BambuCameraStream
+public static class BambuCameraStream
 {
     private const string Username = "bblp";
 
-    private static string AccessCode => Environment.GetEnvironmentVariable("PRINTER_ACCESS_CODE")
-                                        ?? throw new Exception("PRINTER_ACCESS_CODE environment variable not set");
-
-    private static string Hostname => Environment.GetEnvironmentVariable("PRINTER_ADDRESS")
-                                      ?? throw new Exception("PRINTER_ADDRESS environment variable not set");
-
     private const int Port = 6000;
     private const int MaxConnectAttempts = 12;
-    private const int ReadChunkSize = 4096;
-    private const int AuthPacketSize = 80;
     private const int HeaderSize = 16;
+    private const int AuthPacketSize = 80;
+
+    // Auth packet layout
+    private const uint AuthMagic1 = 0x40u;
+    private const uint AuthMagic2 = 0x3000u;
+    private const int UsernameOffset = 16;
+    private const int UsernameLength = 32;
+    private const int AccessCodeOffset = 48;
+    private const int AccessCodeLength = 32;
+
+    // Socket timeouts (ms)
+    private const int ReceiveTimeoutMs = 10_000;
+    private const int SendTimeoutMs = 5_000;
+
+    // Reconnect backoff
+    private const int InitialBackoffMs = 1_000;
+    private const int MaxBackoffMs = 30_000;
+    private const int InnerErrorDelayMs = 500;
 
     // Keep this conservative to avoid renting huge buffers from corrupt/malicious payload sizes.
     private const int MaxPayloadSize = 16 * 1024 * 1024;
 
-    private static ReadOnlySpan<byte> JpegStart => [0xFF, 0xD8, 0xFF, 0xE0];
+    private static ReadOnlySpan<byte> JpegStart => [0xFF, 0xD8, 0xFF];
     private static ReadOnlySpan<byte> JpegEnd => [0xFF, 0xD9];
 
+    private static readonly string AccessCode =
+        Environment.GetEnvironmentVariable("PRINTER_ACCESS_CODE")
+        ?? throw new InvalidOperationException("PRINTER_ACCESS_CODE environment variable not set");
+
+    private static readonly string Hostname =
+        Environment.GetEnvironmentVariable("PRINTER_ADDRESS")
+        ?? throw new InvalidOperationException("PRINTER_ADDRESS environment variable not set");
+    
     private static readonly string ImagesDir = Path.Combine(AppContext.BaseDirectory, "Images");
 
-    public static void Run()
+    public static async Task RunAsync()
     {
-        var connectAttempts = 0;
-        var authData = BuildAuthData();
-
         Directory.CreateDirectory(ImagesDir);
+        
+        using var cts = new CancellationTokenSource();
 
-        while (connectAttempts < MaxConnectAttempts)
+        Console.CancelKeyPress += (_, e) =>
         {
+            e.Cancel = true;
+            cts.Cancel();
+        };
+
+        var authData = BuildAuthData();
+        await using var stdout = Console.OpenStandardOutput();
+
+        var connectAttempts = 0;
+        var backoffMs = InitialBackoffMs;
+
+        while (connectAttempts < MaxConnectAttempts && !cts.IsCancellationRequested)
+        {
+            connectAttempts++;
+
             try
             {
                 using var client = new TcpClient();
-                client.Connect(Hostname, Port);
+                client.ReceiveTimeout = ReceiveTimeoutMs;
+                client.SendTimeout = SendTimeoutMs;
 
-                connectAttempts++;
+                await client.ConnectAsync(Hostname, Port, cts.Token);
 
-                using var sslStream = new SslStream(client.GetStream(), false, (_, _, _, _) => true);
-                sslStream.AuthenticateAsClient(Hostname);
+                // Printer uses a self-signed certificate on the LAN; skip validation intentionally.
+                await using var sslStream = new SslStream(
+                    client.GetStream(), false, (_, _, _, _) => true);
 
-                sslStream.Write(authData);
-                sslStream.Flush();
+                await sslStream.AuthenticateAsClientAsync(Hostname);
 
-                Console.Error.WriteLine("Connected and authenticated successfully.");
+                await sslStream.WriteAsync(authData, cts.Token);
+                await sslStream.FlushAsync(cts.Token);
 
-                ReceiveImages(sslStream);
+                await Console.Error.WriteLineAsync("Connected and authenticated successfully.");
 
+                // Reset attempt counter and backoff on a fully successful connection.
                 connectAttempts = 0;
+                backoffMs = InitialBackoffMs;
+
+                await ReceiveImagesAsync(sslStream, stdout, cts.Token);
+            }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested)
+            {
+                break;
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"Connection error: {ex.Message}");
-                Thread.Sleep(2000);
+                await Console.Error.WriteLineAsync($"Connection error: {ex.Message}");
+
+                try
+                {
+                    await Task.Delay(backoffMs, cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+
+                backoffMs = Math.Min(backoffMs * 2, MaxBackoffMs);
             }
         }
 
-        Console.Error.WriteLine("Max connection attempts reached.");
+        if (cts.IsCancellationRequested)
+        {
+            await Console.Error.WriteLineAsync("Shutdown requested.");
+        }
+        else
+        {
+            await Console.Error.WriteLineAsync("Max connection attempts reached.");
+        }
     }
 
     private static byte[] BuildAuthData()
@@ -73,127 +131,118 @@ public class BambuCameraStream
         var packet = new byte[AuthPacketSize];
         var span = packet.AsSpan();
 
-        BinaryPrimitives.WriteUInt32LittleEndian(span[..4], 0x40u);
-        BinaryPrimitives.WriteUInt32LittleEndian(span[4..8], 0x3000u);
-        BinaryPrimitives.WriteUInt32LittleEndian(span[8..12], 0u);
-        BinaryPrimitives.WriteUInt32LittleEndian(span[12..16], 0u);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[..4], AuthMagic1);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[4..8], AuthMagic2);
+        // Bytes 8..16 are left as zero.
 
-        WriteAsciiFixed(span.Slice(16, 32), Username);
-        WriteAsciiFixed(span.Slice(48, 32), AccessCode);
+        WriteAsciiFixed(span.Slice(UsernameOffset, UsernameLength), Username);
+        WriteAsciiFixed(span.Slice(AccessCodeOffset, AccessCodeLength), AccessCode);
 
         return packet;
     }
 
     private static void WriteAsciiFixed(Span<byte> destination, string value)
     {
-        destination.Clear();
+        if (!Ascii.IsValid(value))
+        {
+            throw new ArgumentException("Value must be ASCII.", nameof(value));
+        }
 
         var byteCount = Encoding.ASCII.GetByteCount(value);
 
         if (byteCount > destination.Length)
         {
-            throw new InvalidOperationException($"Value is too long. Maximum ASCII byte length is {destination.Length}.");
+            throw new InvalidOperationException(
+                $"Value is too long. Maximum ASCII byte length is {destination.Length}.");
         }
 
         Encoding.ASCII.GetBytes(value.AsSpan(), destination);
+        // Caller-provided destination is assumed zero-initialized (new byte[]).
     }
 
-    private static void ReceiveImages(SslStream sslStream)
+    private static async Task ReceiveImagesAsync(
+        SslStream sslStream, Stream stdout, CancellationToken ct)
     {
         var pool = ArrayPool<byte>.Shared;
-        var readBuffer = pool.Rent(ReadChunkSize);
-
-        byte[]? imageBuffer = null;
-        var imageOffset = 0;
-        var payloadSize = 0;
-
-        using var stdout = Console.OpenStandardOutput();
+        var headerBuffer = pool.Rent(HeaderSize);
 
         try
         {
-            while (true)
+            while (!ct.IsCancellationRequested)
             {
                 try
                 {
-                    var bytesRead = sslStream.Read(readBuffer.AsSpan(0, ReadChunkSize));
+                    var header = headerBuffer.AsMemory(0, HeaderSize);
+                    await sslStream.ReadExactlyAsync(header, ct);
 
-                    if (bytesRead == 0)
+                    var payloadSize = BinaryPrimitives.ReadInt32LittleEndian(header.Span[..4]);
+
+                    if ((uint)payloadSize > MaxPayloadSize)
                     {
-                        Console.Error.WriteLine("Connection closed.");
-                        break;
+                        await Console.Error.WriteLineAsync($"Invalid payload size: {payloadSize}");
+                        return;
                     }
 
-                    var chunk = readBuffer.AsSpan(0, bytesRead);
+                    var buffer = pool.Rent(payloadSize);
 
-                    if (imageBuffer is null)
+                    try
                     {
-                        if (bytesRead != HeaderSize)
+                        await sslStream.ReadExactlyAsync(buffer.AsMemory(0, payloadSize), ct);
+
+                        var image = buffer.AsMemory(0, payloadSize);
+
+                        if (IsJpeg(image.Span))
                         {
-                            continue;
+                            await stdout.WriteAsync(image, ct);
+                            await stdout.FlushAsync(ct);
+                            
+                            var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
+                            var imagePath = Path.Combine(ImagesDir, $"image_{timestamp}.jpg");
+                            
+                            await File.WriteAllBytesAsync(imagePath, image, ct);
                         }
-
-                        payloadSize = BinaryPrimitives.ReadInt32LittleEndian(chunk[..4]);
-
-                        if ((uint)payloadSize > MaxPayloadSize)
+                        else
                         {
-                            Console.Error.WriteLine($"Invalid payload size: {payloadSize}");
-                            break;
+                            await Console.Error.WriteLineAsync("Received non-JPEG payload; skipping.");
                         }
-
-                        imageBuffer = pool.Rent(payloadSize);
-                        imageOffset = 0;
-                        continue;
                     }
-
-                    var remaining = payloadSize - imageOffset;
-                    var toCopy = Math.Min(chunk.Length, remaining);
-
-                    chunk[..toCopy].CopyTo(imageBuffer.AsSpan(imageOffset));
-                    imageOffset += toCopy;
-
-                    if (imageOffset != payloadSize)
+                    finally
                     {
-                        continue;
+                        pool.Return(buffer);
                     }
-
-                    var image = imageBuffer.AsSpan(0, payloadSize);
-
-                    if (IsJpeg(image))
-                    {
-                        stdout.Write(image);
-                        stdout.Flush();
-
-                        // var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
-                        // var imagePath = Path.Combine(ImagesDir, $"image_{timestamp}.jpg");
-                        //
-                        // File.WriteAllBytes(imagePath, image);
-                    }
-
-                    pool.Return(imageBuffer);
-                    imageBuffer = null;
-                    imageOffset = 0;
-                    payloadSize = 0;
                 }
-                catch (Exception ex) when (ex is IOException or TimeoutException)
+                catch (EndOfStreamException)
                 {
-                    Console.Error.WriteLine($"Error reading from stream: {ex.Message}");
-                    Thread.Sleep(500);
+                    await Console.Error.WriteLineAsync("Connection closed.");
+                    return;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex) when (ex is IOException or TimeoutException or SocketException)
+                {
+                    await Console.Error.WriteLineAsync($"Error reading from stream: {ex.Message}");
+
+                    try
+                    {
+                        await Task.Delay(InnerErrorDelayMs, ct);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+
+                    // Stream state is unknown after an I/O error; bail out and let the outer loop reconnect.
+                    return;
                 }
             }
         }
         finally
         {
-            pool.Return(readBuffer);
-
-            if (imageBuffer is not null)
-            {
-                pool.Return(imageBuffer);
-            }
+            pool.Return(headerBuffer);
         }
     }
 
-    private static bool IsJpeg(ReadOnlySpan<byte> data)
-    {
-        return data.StartsWith(JpegStart) && data.EndsWith(JpegEnd);
-    }
+    private static bool IsJpeg(ReadOnlySpan<byte> data) =>
+        data.StartsWith(JpegStart) && data.EndsWith(JpegEnd);
 }

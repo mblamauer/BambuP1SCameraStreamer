@@ -1,3 +1,3 @@
 ﻿using BambuStreamer;
 
-BambuCameraStream.Run();
+await BambuCameraStream.RunAsync();
